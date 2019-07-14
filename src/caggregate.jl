@@ -1,10 +1,5 @@
 
 
-abstract type Caggregate end
-abstract type Cstruct <: Caggregate end
-abstract type Cunion <: Caggregate end
-
-
 _strategy(::Type{CA}) where {CA<:Caggregate} = error("Attempted to get alignment strategy for an aggregate without one")
 _fields(::Type{CA}) where {CA<:Caggregate} = error("Attempted to get fields of an aggregate without any")
 
@@ -159,7 +154,7 @@ function Base.getproperty(ca::Union{CA, Caccessor{CA}}, sym::Symbol) where {CA<:
 		
 		if typ isa Tuple
 			(t, b) = typ
-			ityp = sizeof(t) == sizeof(UInt8) ? UInt8 : sizeof(t) == sizeof(UInt16) ? UInt16 : sizeof(t) == sizeof(UInt32) ? UInt32 : UInt64
+			ityp = sizeof(t) == sizeof(UInt8) ? UInt8 : sizeof(t) == sizeof(UInt16) ? UInt16 : sizeof(t) == sizeof(UInt32) ? UInt32 : sizeof(t) == sizeof(UInt64) ? UInt64 : UInt128
 			o = ityp(off & (8-1))
 			field = _unsafe_load(reinterpret(Ptr{UInt8}, pointer_from_objref(ca) + off÷8), ityp, Val(o), Val(b))
 			mask = _bitmask(ityp, Val(b))
@@ -183,7 +178,7 @@ function Base.setproperty!(ca::Union{CA, Caccessor{CA}}, sym::Symbol, val) where
 		
 		if typ isa Tuple
 			(t, b) = typ
-			ityp = sizeof(t) == sizeof(UInt8) ? UInt8 : sizeof(t) == sizeof(UInt16) ? UInt16 : sizeof(t) == sizeof(UInt32) ? UInt32 : UInt64
+			ityp = sizeof(t) == sizeof(UInt8) ? UInt8 : sizeof(t) == sizeof(UInt16) ? UInt16 : sizeof(t) == sizeof(UInt32) ? UInt32 : sizeof(t) == sizeof(UInt64) ? UInt64 : UInt128
 			o = ityp(off & (8-1))
 			field = _unsafe_load(reinterpret(Ptr{UInt8}, pointer_from_objref(ca) + off÷8), ityp, Val(o), Val(b))
 			mask = _bitmask(ityp, Val(b)) << o
@@ -207,34 +202,35 @@ end
 
 
 const _alignExprs = (Symbol("@calign"), :(CBinding.$(Symbol("@calign"))))
+const _enumExprs = (Symbol("@cenum"), :(CBinding.$(Symbol("@cenum"))))
+const _arrayExprs = (Symbol("@carray"), :(CBinding.$(Symbol("@carray"))))
 const _structExprs = (Symbol("@cstruct"), :(CBinding.$(Symbol("@cstruct"))))
 const _unionExprs = (Symbol("@cunion"), :(CBinding.$(Symbol("@cunion"))))
 
 # macros need to accumulate definition of sub-structs/unions and define them above the expansion of the macro itself
-_expand(x, deps::Vector{Pair{Symbol, Expr}}, escape::Bool = true) = escape ? esc(x) : x
-function _expand(e::Expr, deps::Vector{Pair{Symbol, Expr}}, escape::Bool = true)
+_expand(mod::Module, deps::Vector{Pair{Symbol, Expr}}, x, escape::Bool = true) = escape ? esc(x) : x
+function _expand(mod::Module, deps::Vector{Pair{Symbol, Expr}}, e::Expr, escape::Bool = true)
 	if Base.is_expr(e, :macrocall)
-		if length(e.args) > 1 && e.args[1] in (_alignExprs..., _structExprs..., _unionExprs...)
+		if length(e.args) > 1 && e.args[1] in (_alignExprs..., _enumExprs..., _arrayExprs..., _structExprs..., _unionExprs...)
 			if e.args[1] in _alignExprs
-				return _calign(filter(x -> !(x isa LineNumberNode), e.args[2:end])..., deps)
+				return _calign(mod, deps, filter(x -> !(x isa LineNumberNode), e.args[2:end])...)
+			elseif e.args[1] in _enumExprs
+				return _cenum(mod, deps, filter(x -> !(x isa LineNumberNode), e.args[2:end])...)
+			elseif e.args[1] in _arrayExprs
+				return _carray(mod, deps, filter(x -> !(x isa LineNumberNode), e.args[2:end])...)
 			elseif e.args[1] in _structExprs
-				return _caggregate(:cstruct, filter(x -> !(x isa LineNumberNode), e.args[2:end])..., deps)
+				return _caggregate(mod, deps, :cstruct, filter(x -> !(x isa LineNumberNode), e.args[2:end])...)
 			elseif e.args[1] in _unionExprs
-				return _caggregate(:cunion, filter(x -> !(x isa LineNumberNode), e.args[2:end])..., deps)
+				return _caggregate(mod, deps, :cunion, filter(x -> !(x isa LineNumberNode), e.args[2:end])...)
 			end
 		else
-			todo"determine if @__MODULE__ should be __module__ from the macro instead?"
-			return _expand(macroexpand(@__MODULE__, e, recursive = false), deps)
+			return _expand(mod, deps, macroexpand(mod, e, recursive = false))
 		end
 	elseif Base.is_expr(e, :ref, 2)
-		return _carray(e, deps)
-	elseif Base.is_expr(e, :call, 3) && e.args[1] == :(:) && Base.is_expr(e.args[2], :(::), 2) && e.args[3] isa Integer
-		# WARNING:  this is probably bad form and should be moved into _caggregate instead
-		# NOTE:  when using i::Cint:3 syntax for bitfield, the operators are grouped in the opposite order
-		return :($(_expand(e.args[2].args[1], deps))::($(_expand(e.args[2].args[2], deps)):$(e.args[3])))
+		return _carray(mod, deps, e)
 	else
 		for i in eachindex(e.args)
-			e.args[i] = _expand(e.args[i], deps, escape)
+			e.args[i] = _expand(mod, deps, e.args[i], escape)
 		end
 		return e
 	end
@@ -242,26 +238,26 @@ end
 
 
 
-macro calign(exprs...) return _calign(exprs..., nothing) end
+macro calign(exprs...) return _calign(__module__, nothing, exprs...) end
 
-function _calign(expr::Union{Integer, Expr}, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing})
+function _calign(mod::Module, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing}, expr::Union{Integer, Expr})
 	isOuter = isnothing(deps)
 	deps = isOuter ? Pair{Symbol, Expr}[] : deps
-	def = Expr(:align, _expand(expr, deps))
+	def = Expr(:align, _expand(mod, deps, expr))
 	
 	return isOuter ? quote $(map(last, deps)...) ; $(def) end : def
 end
 
 
 
-macro ctypedef(exprs...) return _ctypedef(exprs..., nothing) end
+macro ctypedef(exprs...) return _ctypedef(__module__, nothing, exprs...) end
 
-function _ctypedef(name::Symbol, expr::Union{Symbol, Expr}, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing})
+function _ctypedef(mod::Module, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing}, name::Symbol, expr::Union{Symbol, Expr})
 	escName = esc(name)
 	
 	isOuter = isnothing(deps)
 	deps = isOuter ? Pair{Symbol, Expr}[] : deps
-	expr = _expand(expr, deps)
+	expr = _expand(mod, deps, expr)
 	push!(deps, name => quote
 		const $(escName) = $(expr)
 	end)
@@ -271,27 +267,27 @@ end
 
 
 
-macro cstruct(exprs...) return _caggregate(:cstruct, exprs..., nothing) end
-macro cunion(exprs...) return _caggregate(:cunion, exprs..., nothing) end
+macro cstruct(exprs...) return _caggregate(__module__, nothing, :cstruct, exprs...) end
+macro cunion(exprs...) return _caggregate(__module__, nothing, :cunion, exprs...) end
 
-function _caggregate(kind::Symbol, name::Symbol, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing})
-	return _caggregate(kind, name, nothing, nothing, deps)
+function _caggregate(mod::Module, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing}, kind::Symbol, name::Symbol)
+	return _caggregate(mod, deps, kind, name, nothing, nothing)
 end
 
-function _caggregate(kind::Symbol, body::Expr, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing})
-	return _caggregate(kind, nothing, body, nothing, deps)
+function _caggregate(mod::Module, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing}, kind::Symbol, body::Expr)
+	return _caggregate(mod, deps, kind, nothing, body, nothing)
 end
 
-function _caggregate(kind::Symbol, body::Expr, strategy::Symbol, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing})
-	return _caggregate(kind, nothing, body, strategy, deps)
+function _caggregate(mod::Module, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing}, kind::Symbol, body::Expr, strategy::Symbol)
+	return _caggregate(mod, deps, kind, nothing, body, strategy)
 end
 
-function _caggregate(kind::Symbol, name::Union{Symbol, Nothing}, body::Union{Expr, Nothing}, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing})
-	return _caggregate(kind, name, body, nothing, deps)
+function _caggregate(mod::Module, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing}, kind::Symbol, name::Union{Symbol, Nothing}, body::Union{Expr, Nothing})
+	return _caggregate(mod, deps, kind, name, body, nothing)
 end
 
 todo"need to handle unknown-length aggregates with last field like `char c[]`"
-function _caggregate(kind::Symbol, name::Union{Symbol, Nothing}, body::Union{Expr, Nothing}, strategy::Union{Symbol, Nothing}, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing})
+function _caggregate(mod::Module, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing}, kind::Symbol, name::Union{Symbol, Nothing}, body::Union{Expr, Nothing}, strategy::Union{Symbol, Nothing})
 	isnothing(body) || Base.is_expr(body, :braces) || Base.is_expr(body, :bracescat) || error("Expected @$(kind) to have a `{ ... }` expression for the body of the type, but found `$(body)`")
 	isnothing(body) && !isnothing(strategy) && error("Expected @$(kind) to have a body if alignment strategy is to be specified")
 	isnothing(strategy) || (startswith(String(strategy), "__") && endswith(String(strategy), "__") && length(String(strategy)) > 4) || error("Expected @$(kind) to have packing specified as `__STRATEGY__`, such as `__packed__` or `__native__`")
@@ -311,25 +307,63 @@ function _caggregate(kind::Symbol, name::Union{Symbol, Nothing}, body::Union{Exp
 	else
 		super = kind === :cunion ? :(Cunion) : :(Cstruct)
 		fields = []
-		if !isnothing(body)
-			for arg in body.args
-				arg = _expand(arg, deps)
-				if Base.is_expr(arg, :align, 1)
-					align = arg.args[1]
-					push!(fields, :(nothing => $(align)))
-				else
-					Base.is_expr(arg, :(::)) && (length(arg.args) != 2 || arg.args[1] === :_) && error("Expected @$(kind) to have a `fieldName::FieldType` expression in the body of the type, but found `$(arg)`")
-					
-					argName = Base.is_expr(arg, :(::), 1) || !Base.is_expr(arg, :(::)) ? :_ : arg.args[1]
-					argName = Base.is_expr(argName, :escape, 1) ? argName.args[1] : argName
-					argName isa Symbol || error("Expected a @$(kind) to have a Symbol for a field name, but found `$(argName)`")
-					
-					argType = Base.is_expr(arg, :(::)) ? arg.args[end] : arg
-					if Base.is_expr(argType, :call, 3) && argType.args[1] == :(:) && argType.args[3] isa Integer
-						(argType, bits) = argType.args[2:end]
-						push!(fields, :($(QuoteNode(argName)) => ($(argType), $(bits))))
+		for arg in body.args
+			arg = _expand(mod, deps, arg)
+			if Base.is_expr(arg, :align, 1)
+				align = arg.args[1]
+				push!(fields, :(nothing => $(align)))
+			elseif Base.is_expr(arg, :escape, 1) && !startswith(String(arg.args[1]), "##anonymous#")
+				# this is just a type definition, not a field
+			else
+				Base.is_expr(arg, :(::)) && (length(arg.args) != 2 || arg.args[1] === :_) && error("Expected @$(kind) to have a `fieldName::FieldType` expression in the body of the type, but found `$(arg)`")
+				
+				argType = Base.is_expr(arg, :(::)) ? arg.args[end] : arg
+				args = Base.is_expr(arg, :(::), 1) || !Base.is_expr(arg, :(::)) ? :_ : arg.args[1]
+				args = Base.is_expr(args, :tuple) ? args.args : (args,)
+				for arg in args
+					if arg isa Symbol
+						push!(fields, :($(QuoteNode(arg)) => $(argType)))
+					elseif Base.is_expr(arg, :escape, 1) && arg.args[1] isa Symbol
+						push!(fields, :($(QuoteNode(arg.args[1])) => $(argType)))
+					elseif Base.is_expr(arg, :call, 3) && arg.args[1] === :(:) && arg.args[3] isa Integer
+						push!(fields, :($(QuoteNode(arg.args[2])) => ($(argType), $(arg.args[3]))))
+					elseif Base.is_expr(arg, :call, 3) && Base.is_expr(arg.args[1], :escape, 1) && arg.args[1].args[1] === :(:) && Base.is_expr(arg.args[3], :escape, 1) && arg.args[3].args[1] isa Integer
+						push!(fields, :($(QuoteNode(arg.args[2].args[1])) => ($(argType), $(arg.args[3].args[1]))))
 					else
-						push!(fields, :($(QuoteNode(argName)) => $(argType)))
+						function _parseAugmentedField(a)
+							a = deepcopy(a)
+							if Base.is_expr(a, :(::), 2)
+								(aname, atype) = _parseAugmentedField(a.args[2])
+								isnothing(aname) || error("Unable to parse @$(kind) field, unexpected expression `$(a)`")
+								return (Base.is_expr(a.args[1], :escape, 1) && a.args[1].args[1] isa Symbol ? a.args[1].args[1] : a.args[1], atype)
+							elseif Base.is_expr(a, :curly) && length(a.args) >= 3 && a.args[1] in (:Carray, esc(:Carray), :(CBinding.Carray), Expr(:., esc(:CBinding), esc(QuoteNode(:Carray))))
+								(aname, atype) = _parseAugmentedField(a.args[2])
+								isnothing(aname) || error("Unable to parse @$(kind) field, unexpected expression `$(a)`")
+								a.args[2] = atype
+								if length(a.args) == 4 && Base.is_expr(a.args[4], :call, 2) && a.args[4].args[1] === :sizeof
+									(aname, atype) = _parseAugmentedField(a.args[4].args[2])
+									isnothing(aname) || error("Unable to parse @$(kind) field, unexpected expression `$(a)`")
+									a.args[4].args[2] = atype
+								end
+								return (nothing, a)
+							elseif Base.is_expr(a, :curly) && length(a.args) >= 1 && a.args[1] in (:Ptr, esc(:Ptr), :(Base.Ptr), Expr(:., esc(:Base), esc(QuoteNode(:Ptr))))
+								if length(a.args) == 1
+									push!(a.args, argType)
+								else
+									(aname, atype) = _parseAugmentedField(a.args[end])
+									isnothing(aname) || error("Unable to parse @$(kind) field, unexpected expression `$(a)`")
+									a.args[end] = atype
+								end
+								return (nothing, a)
+							elseif Base.is_expr(a, :braces, 0)
+								return (nothing, argType)
+							else
+								error("Expected @$(kind) to have a `fieldName`, `fieldName::Ptr{}`, or `fieldName::{}[N]` field name expression or some combination of them, but found `$(a)` within `$(arg)`")
+							end
+						end
+						
+						(aname, atype) = _parseAugmentedField(arg)
+						push!(fields, :($(QuoteNode(aname)) => $(atype)))
 					end
 				end
 			end
@@ -337,7 +371,7 @@ function _caggregate(kind::Symbol, name::Union{Symbol, Nothing}, body::Union{Exp
 		
 		_stripPtrTypes(x) = x
 		function _stripPtrTypes(e::Expr)
-			if Base.is_expr(e, :curly, 2) && e.args[1] in (:Ptr, esc(:Ptr))
+			if Base.is_expr(e, :curly, 2) && e.args[1] in (:Ptr, esc(:Ptr), :(Base.Ptr), Expr(:., esc(:Base), esc(QuoteNode(:Ptr))))
 				e.args[2] = :Cvoid
 				return e
 			end
@@ -347,7 +381,7 @@ function _caggregate(kind::Symbol, name::Union{Symbol, Nothing}, body::Union{Exp
 		
 		push!(deps, name => quote
 			mutable struct $(escName) <: $(super)
-				mem::NTuple{_computelayout($(strategy), $(super), ($(map(_stripPtrTypes, fields)...),), total = true)÷8, UInt8}
+				mem::NTuple{_computelayout($(strategy), $(super), ($(map(_stripPtrTypes, deepcopy(fields))...),), total = true)÷8, UInt8}
 				
 				$(escName)(::UndefInitializer) = new()
 			end
@@ -361,18 +395,113 @@ end
 
 
 
-macro carray(exprs...) _carray(exprs..., nothing) end
+macro carray(exprs...) _carray(__module__, nothing, exprs...) end
 
-function _carray(expr::Expr, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing})
+function _carray(mod::Module, deps::Union{Vector{Pair{Symbol, Expr}}, Nothing}, expr::Expr)
 	Base.is_expr(expr, :ref, 2) || error("Expected C array definition to be of the form `ElementType[N]`")
 	
 	isOuter = isnothing(deps)
 	deps = isOuter ? Pair{Symbol, Expr}[] : deps
-	expr.args[1] = _expand(expr.args[1], deps)
-	expr.args[2] = _expand(expr.args[2], deps)
+	expr.args[1] = _expand(mod, deps, expr.args[1])
+	expr.args[2] = _expand(mod, deps, expr.args[2])
 	def = :(Carray{$(expr.args[1]), $(expr.args[2]), sizeof(Carray{$(expr.args[1]), $(expr.args[2])})})
 	
 	return isOuter ? quote $(map(last, deps)...) ; $(def) end : def
 end
 
 
+
+# alignment strategies
+const ALIGN_NATIVE = Val{:native}
+const ALIGN_PACKED = Val{:packed}
+
+alignof(::Type{ALIGN_PACKED}, ::Type{<:Any}) = 1
+
+alignof(::Type{ALIGN_PACKED}, ::Type{CE}) where {_CE<:Cenum, CE<:Union{_CE, Caccessor{_CE}}} = 1
+alignof(::Type{ALIGN_PACKED}, ::Type{CA}) where {_CA<:Carray, CA<:Union{_CA, Caccessor{_CA}}} = 1
+alignof(::Type{ALIGN_PACKED}, ::Type{CA}) where {_CA<:Caggregate, CA<:Union{_CA, Caccessor{_CA}}} = 1
+
+alignof(::Type{ALIGN_NATIVE}, ::Type{CE}) where {_CE<:Cenum, CE<:Union{_CE, Caccessor{_CE}}} = alignof(ALIGN_NATIVE, eltype(_CE))
+alignof(::Type{ALIGN_NATIVE}, ::Type{CA}) where {_CA<:Carray, CA<:Union{_CA, Caccessor{_CA}}} = alignof(ALIGN_NATIVE, eltype(_CA))
+alignof(::Type{ALIGN_NATIVE}, ::Type{CA}) where {_CA<:Caggregate, CA<:Union{_CA, Caccessor{_CA}}} = _computelayout(_CA, alignment = true)
+
+const (_i8a, _i16a, _i32a, _i64a, _f32a, _f64a) = let
+	(i8a, i16a, i32a, i64a, f32a, f64a) = refs = ((Ref{UInt}() for i in 1:6)...,)
+	ccall("jl_native_alignment",
+		Nothing,
+		(Ptr{UInt}, Ptr{UInt}, Ptr{UInt}, Ptr{UInt}, Ptr{UInt}, Ptr{UInt}),
+		i8a, i16a, i32a, i64a, f32a, f64a
+	)
+	(Int(r[]) for r in refs)
+end
+alignof(::Type{ALIGN_NATIVE}, ::Type{UInt8})   = _i8a
+alignof(::Type{ALIGN_NATIVE}, ::Type{UInt16})  = _i16a
+alignof(::Type{ALIGN_NATIVE}, ::Type{UInt32})  = _i32a
+alignof(::Type{ALIGN_NATIVE}, ::Type{UInt64})  = _i64a
+alignof(::Type{ALIGN_NATIVE}, ::Type{Float32}) = _f32a
+alignof(::Type{ALIGN_NATIVE}, ::Type{Float64}) = _f64a
+alignof(::Type{ALIGN_NATIVE}, ::Type{<:Ptr})   = alignof(ALIGN_NATIVE, sizeof(Ptr{Cvoid}) == sizeof(UInt32) ? UInt32 : UInt64)
+alignof(::Type{ALIGN_NATIVE}, ::Type{S}) where {S<:Signed} = alignof(ALIGN_NATIVE, unsigned(S))
+alignof(::Type{ALIGN_NATIVE}, ::Type{UInt128}) = 2*alignof(ALIGN_NATIVE, UInt64)
+alignof(::Type{ALIGN_NATIVE}, ::Type{Clongdouble}) = 2*alignof(ALIGN_NATIVE, Cdouble)
+
+function checked_alignof(x, y)
+	a = alignof(x, y)
+	a == 0 || a == nextpow(2, a) || error("Alignment must be a power of 2")
+	return a
+end
+
+padding(::Type{ALIGN_PACKED}, offset::Int, align::Int) = (align%8) == 0 ? padding(ALIGN_NATIVE, offset, align) : 0
+padding(::Type{ALIGN_PACKED}, offset::Int, typ::DataType, bits::Int = 0) = bits == 0 ? padding(ALIGN_PACKED, offset, checked_alignof(ALIGN_PACKED, typ)*8) : 0
+
+padding(::Type{ALIGN_NATIVE}, offset::Int, align::Int) = -offset & (align - 1)
+function padding(::Type{ALIGN_NATIVE}, offset::Int, typ::DataType, bits::Int = 0)
+	pad = padding(ALIGN_NATIVE, offset, checked_alignof(ALIGN_NATIVE, typ)*8)
+	return 0 < bits <= pad ? 0 : pad
+end
+
+_computelayout(::Type{CA}; kwargs...) where {_CA<:Caggregate, CA<:Union{_CA, Caccessor{_CA}}} = _computelayout(_strategy(CA), CA, _fields(CA); kwargs...)
+function _computelayout(strategy::DataType, ::Type{CA}, fields::Tuple; total::Bool = false, alignment::Bool = false) where {_CA<:Caggregate, CA<:Union{_CA, Caccessor{_CA}}}
+	op = CA <: Cstruct ? (+) : (max)
+	
+	align = 1  # in bytes
+	size = 0  # in bits
+	result = ()  # ((symbol, (type, bits), offset), ...)
+	for (sym, typ) in fields
+		start = CA <: Cstruct ? size : 0
+		if sym === :_ && typ <: Caggregate
+			offset = op(start, padding(strategy, start, typ))
+			result = (result..., map(((s, t, o),) -> (s, t, offset+o), _computelayout(typ))...)
+			align = max(align, checked_alignof(strategy, typ))
+			size = op(size, padding(strategy, start, typ) + sizeof(typ)*8)
+		elseif isnothing(sym)
+			align = max(align, typ)
+			size = op(size, padding(strategy, start, typ*8))
+		else
+			if typ isa Tuple
+				(typ, bits) = typ
+			else
+				bits = 0
+			end
+			
+			offset = op(start, padding(strategy, start, typ, bits))
+			if sym !== :_
+				result = (result..., (sym, (bits == 0 ? typ : (typ, bits)), offset))
+			end
+			align = max(align, checked_alignof(strategy, typ))
+			size = op(size, padding(strategy, start, typ, bits) + (bits == 0 ? sizeof(typ)*8 : bits))
+		end
+	end
+	
+	if alignment
+		return align
+	end
+	
+	if total
+		size += padding(strategy, size, align*8)
+		size += -size & (8-1)  # ensure size is divisible by 8
+		return size
+	end
+	
+	return result
+end
