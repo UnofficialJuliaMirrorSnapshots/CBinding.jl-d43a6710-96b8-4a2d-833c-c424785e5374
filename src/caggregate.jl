@@ -4,7 +4,7 @@ _strategy(::Type{CA}) where {CA<:Caggregate} = error("Attempted to get alignment
 _fields(::Type{CA}) where {CA<:Caggregate} = error("Attempted to get fields of an aggregate without any")
 
 
-function (::Type{CA})(; kwargs...) where (CA<:Caggregate)
+function (::Type{CA})(; kwargs...) where {CA<:Caggregate}
 	result = CA(undef)
 	if isempty(kwargs)
 		setfield!(result, :mem, map(zero, getfield(result, :mem)))
@@ -15,6 +15,7 @@ function (::Type{CA})(; kwargs...) where (CA<:Caggregate)
 	return result
 end
 
+Base.convert(::Type{CA}, nt::NamedTuple) where {CA<:Caggregate} = CA(; nt...)
 
 isanonymous(ca::Caggregate) = isanonymous(typeof(ca))
 isanonymous(::Type{CA}) where {CA<:Caggregate} = match(r"^##anonymous#\d+$", string(CA.name.name)) !== nothing
@@ -43,7 +44,7 @@ mutable struct Carray{T, N, S} <: AbstractArray{T, 1}
 end
 Carray{T, N}(u::UndefInitializer) where {T, N} = Carray{T, N, sizeof(Carray{T, N})}(u)
 
-function (::Type{CA})() where (CA<:Carray)
+function (::Type{CA})() where {CA<:Carray}
 	result = CA(undef)
 	setfield!(result, :mem, map(zero, getfield(result, :mem)))
 	return result
@@ -120,6 +121,9 @@ propertytypes(::Type{CA}; kwargs...) where {_CA<:Caggregate, CA<:Union{_CA, Cacc
 
 _strategy(::Type{<:Caccessor{CA}}) where {CA<:Caggregate} = _strategy(CA)
 _fields(::Type{<:Caccessor{CA}}) where {CA<:Caggregate} = _fields(CA)
+
+aggregatetype(::Type{CA}) where {CA<:Caggregate} = CA
+aggregatetype(::Type{Caccessor{CA}}) where {CA<:Caggregate} = CA
 
 @generated function _bitmask(::Type{ityp}, ::Val{bits}) where {ityp, bits}
 	mask = zero(ityp)
@@ -462,13 +466,13 @@ end
 
 _computelayout(::Type{CA}; kwargs...) where {_CA<:Caggregate, CA<:Union{_CA, Caccessor{_CA}}} = _computelayout(_strategy(CA), CA, _fields(CA); kwargs...)
 function _computelayout(strategy::DataType, ::Type{CA}, fields::Tuple; total::Bool = false, alignment::Bool = false) where {_CA<:Caggregate, CA<:Union{_CA, Caccessor{_CA}}}
-	op = CA <: Cstruct ? (+) : (max)
+	op = aggregatetype(CA) <: Cstruct ? (+) : (max)
 	
 	align = 1  # in bytes
 	size = 0  # in bits
 	result = ()  # ((symbol, (type, bits), offset), ...)
 	for (sym, typ) in fields
-		start = CA <: Cstruct ? size : 0
+		start = aggregatetype(CA) <: Cstruct ? size : 0
 		if sym === :_ && typ <: Caggregate
 			offset = op(start, padding(strategy, start, typ))
 			result = (result..., map(((s, t, o),) -> (s, t, offset+o), _computelayout(typ))...)
