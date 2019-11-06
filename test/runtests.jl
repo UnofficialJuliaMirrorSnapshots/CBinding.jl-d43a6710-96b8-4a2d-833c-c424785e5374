@@ -18,7 +18,12 @@ function checkJL(expr, val)
 	types = Base.invokelatest(CBinding.propertytypes, x)
 	for (ind, prop) in enumerate(Base.invokelatest(propertynames, x))
 		x = Base.invokelatest(X.X)
-		Base.invokelatest(setproperty!, x, prop, sizeof(types[ind]) < sizeof(val) ? Core.Intrinsics.trunc_int(types[ind], val) : reinterpret(types[ind], val))
+		v1 = sizeof(types[ind]) < sizeof(val) ? Core.Intrinsics.trunc_int(types[ind], val) : reinterpret(types[ind], val)
+		Base.invokelatest(setproperty!, x, prop, v1)
+		v2 = Base.invokelatest(getproperty, x, prop)
+		Base.invokelatest(setproperty!, x, prop, v2)
+		v3 = Base.invokelatest(getproperty, x, prop)
+		@test v2 === v3
 		push!(result, "$(String(prop)): $(bytes2hex(UInt8[getfield(x, :mem)...,]))")
 	end
 	return result
@@ -62,6 +67,7 @@ function checkC(expr, val)
 		def = replace(def, "Cdouble" => "double")
 		def = replace(def, "Clongdouble" => "long double")
 		def = replace(def, "Clong" => "signed long")
+		def = replace(def, r"} (\w+) (__attribute__[^;]+)" => s"} \2 \1")
 		
 		use = []
 		push!(use, """
@@ -345,6 +351,18 @@ include("layout-tests.jl")
 		@test bl.x.y == 0 && bl.x.z == 0
 		bl.x.z = 123
 		@test bl.x.y == 0 && bl.x.z == 123
+		
+		@cstruct ArrayOfStruct {
+			x::BrokenLayout[2]
+		}
+		@test sizeof(ArrayOfStruct) == 2*2*sizeof(Cint)
+		aos = ArrayOfStruct()
+		@test typeof(aos.x) <: CBinding.Caccessor
+		@test typeof(aos.x[]) <: Carray
+		@test typeof(aos.x[2]) <: CBinding.Caccessor
+		@test typeof(aos.x[2][]) <: BrokenLayout
+		@test typeof(aos.x[2].x) <: CBinding.Caccessor
+		@test typeof(aos.x[2].x.y) <: Cint
 	end
 	
 	
@@ -573,6 +591,89 @@ include("layout-tests.jl")
 	end
 	
 	
+	@testset "@cenum" begin
+		@eval @cenum SimpleEnum {
+			SE1,
+			SE2,
+			SE3,
+		}
+		@test sizeof(SimpleEnum) == 4
+		@test SE1 == 0
+		@test SE2 == 1
+		@test SE3 == 2
+		
+		@eval @cenum LessSimpleEnum {
+			LSE1,
+			LSE2,
+			LSE3 = -1,
+		}
+		@test sizeof(LessSimpleEnum) == 4
+		@test LSE1 == 0
+		@test LSE2 == 1
+		@test LSE3 == -1
+		
+		@eval @cenum ComplexEnum {
+			CE1 = 1,
+			CE2 = CE1,
+			CE3 = 0,
+			CE4,
+		}
+		@test sizeof(ComplexEnum) == 4
+		@test CE1 == 1
+		@test CE2 == 1
+		@test CE3 == 0
+		@test CE4 == 1
+		
+		@eval @cenum TrickyEnum {
+			TE1 = -1,
+			TE2 = 0xffffffff,
+		}
+		@test sizeof(TrickyEnum) == 8
+		@test TE1 == -1
+		@test TE2 == 0xffffffff
+		
+		@eval @cenum PackedSimpleEnum {
+			PSE1,
+			PSE2,
+			PSE3,
+		} __packed__
+		@test sizeof(PackedSimpleEnum) == 1
+		@test PSE1 == 0
+		@test PSE2 == 1
+		@test PSE3 == 2
+		
+		@eval @cenum PackedLessSimpleEnum {
+			PLSE1,
+			PLSE2,
+			PLSE3 = -1,
+		} __packed__
+		@test sizeof(PackedLessSimpleEnum) == 1
+		@test PLSE1 == 0
+		@test PLSE2 == 1
+		@test PLSE3 == -1
+		
+		@eval @cenum PackedComplexEnum {
+			PCE1 = 1,
+			PCE2 = PCE1,
+			PCE3 = 0,
+			PCE4,
+		} __packed__
+		@test sizeof(PackedComplexEnum) == 1
+		@test PCE1 == 1
+		@test PCE2 == 1
+		@test PCE3 == 0
+		@test PCE4 == 1
+		
+		@eval @cenum PackedTrickyEnum {
+			PTE1 = -1,
+			PTE2 = 0xffffffff,
+		} __packed__
+		@test sizeof(PackedTrickyEnum) == 8
+		@test PTE1 == -1
+		@test PTE2 == 0xffffffff
+	end
+	
+	
 	@testset "@ctypedef" begin
 		@eval @ctypedef EmptyStructTypedef @cstruct {
 		} __packed__
@@ -589,6 +690,15 @@ include("layout-tests.jl")
 		} __packed__
 		@test sizeof(CintUnionTypedef) == sizeof(Cint)
 		@test :i in propertynames(CintUnionTypedef)
+		
+		@eval @ctypedef CenumTypedef @cenum {
+			CENUM_TYPEDEF_1,
+			CENUM_TYPEDEF_2 = 1 << 8,
+			CENUM_TYPEDEF_3 = CENUM_TYPEDEF_2,
+		} __packed__
+		@test sizeof(CenumTypedef) == 2
+		@test CENUM_TYPEDEF_3 != CENUM_TYPEDEF_1
+		@test CENUM_TYPEDEF_3 == CENUM_TYPEDEF_2
 		
 		@eval @ctypedef CuintArrayTypedef Cuint[32]
 		@test sizeof(CuintArrayTypedef) == sizeof(Cuint)*32
