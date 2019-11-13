@@ -1,24 +1,6 @@
 todo"add ability to show a Cfunction's signature, so perhaps storing arg names is needed"
 
 
-# calling conventions
-struct Cconvention{SymT}
-end
-
-const STDCALL  = Cconvention{:stdcall}
-const CDECL    = Cconvention{:cdecl}
-const FASTCALL = Cconvention{:fastcall}
-const THISCALL = Cconvention{:thiscall}
-
-convention(::Type{Cconvention{SymT}}) where {SymT} = SymT
-convention(conv::Cconvention) = convention(typeof(conv))
-
-todo"determine the correct default conventions for each platform"
-todo"some compilers use different calling convention for variadic functions"
-todo"identify what is Julia's calling convention"
-default_convention(::Type{ArgsT}) where {ArgsT<:Tuple} = ifelse(Sys.iswindows(), STDCALL, CDECL)
-
-
 struct Cfunction{RetT, ArgsT<:Tuple, ConvT<:Cconvention}
 	let constructor = false end
 end
@@ -49,6 +31,13 @@ Cfunction{RetT, ArgsT}(func::Base.CFunction) where {RetT, ArgsT<:Tuple} = (Cfunc
 end
 
 convention(::Type{Cfunction{RetT, ArgsT, ConvT}}) where {RetT, ArgsT<:Tuple, ConvT<:Cconvention} = convention(ConvT)
+convention(::Type{Cconvention{SymT}}) where {SymT} = SymT
+convention(conv::Cconvention) = convention(typeof(conv))
+
+todo"determine the correct default conventions for each platform"
+todo"some compilers use different calling convention for variadic functions"
+todo"identify what is Julia's calling convention"
+default_convention(::Type{ArgsT}) where {ArgsT<:Tuple} = ifelse(Sys.iswindows(), STDCALL, CDECL)
 
 
 # https://www.gnu.org/software/libc/manual/html_node/How-Variadic.html
@@ -69,7 +58,7 @@ cconvert_default(::Type{T}) where {E, T<:AbstractArray{E}} = Ptr{E}
 
 
 (f::Ptr{Cfunction{RetT, ArgsT}})(args...) where {RetT, ArgsT<:Tuple} = Cfunction{RetT, ArgsT, default_convention(ArgsT)}(reinterpret(Ptr{Cvoid}, f))(args...)
-(f::Ptr{Cfunction{RetT, ArgsT, ConvT}})(args...) where {RetT, ArgsT<:Tuple, ConvT<:Cconvention} = invoke(f, args...)
+(f::Ptr{Cfunction{RetT, ArgsT, ConvT}})(args...) where {RetT, ArgsT<:Tuple, ConvT<:Cconvention} = invoke(reinterpret(Ptr{Cfunction{concrete(RetT), ArgsT, ConvT}}, f), args...)
 @generated function invoke(f::Ptr{Cfunction{RetT, ArgsT, ConvT}}, args...) where {RetT, ArgsT<:Tuple, ConvT<:Cconvention}
 	error = nothing
 	_tuplize(::Type{Tuple{}}) = ()
